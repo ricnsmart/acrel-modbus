@@ -1,5 +1,7 @@
 package acrel
 
+import "fmt"
+
 // Field 指安科瑞协议中没有寄存器实际地址的消息体
 // 它拥有和寄存器类似的功能
 type Field interface {
@@ -20,6 +22,9 @@ type DecodableField interface {
 	Decoder
 }
 
+// DecodableFields
+// len不一定等于fields中字段的长度
+// 因此需要len字段来确定字段组整体长度
 type DecodableFields struct {
 	len int
 
@@ -43,4 +48,45 @@ func (p *DecodableFields) Decode(data []byte, values map[string]any) {
 		end := start + fd.Len()
 		fd.Decode(data[start:end], values)
 	}
+}
+
+type Encoder interface {
+	Encode(params map[string]interface{}, dst []byte) error
+}
+
+type EncodableField interface {
+	Encoder
+	Field
+}
+
+type EncodableFields []EncodableField
+
+func Len[T Field](fs []T) int {
+	var l int
+	for _, f := range fs {
+		l = l + f.Len()
+	}
+	return l
+}
+
+func Encode[T EncodableField](params map[string]interface{}, fs []T) ([]byte, error) {
+	result := make([]byte, Len(fs))
+	for _, field := range fs {
+		start := field.Start() - 0
+		end := start + field.Len()
+		if err := field.Encode(params, result[start:end]); err != nil {
+			return nil, fmt.Errorf("decode error: %v; field: %v, start: %v,end: %v", err, field.Name(), start, end)
+		}
+	}
+	return result, nil
+}
+
+func Bytes[T EncodableField](function uint8, params map[string]interface{}, fs []T) ([]byte, error) {
+	data, err := Encode(params, fs)
+	if err != nil {
+		return nil, err
+	}
+	f := Frame{Function: function}
+	f.SetData(data)
+	return f.Bytes(), nil
 }
