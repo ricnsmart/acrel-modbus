@@ -59,8 +59,6 @@ type EncodableField interface {
 	Field
 }
 
-type EncodableFields []EncodableField
-
 func Len[T Field](fs []T) int {
 	var l int
 	for _, f := range fs {
@@ -81,12 +79,12 @@ func Encode[T EncodableField](params map[string]interface{}, fs []T) ([]byte, er
 	return result, nil
 }
 
-func Bytes[T EncodableField](function uint8, params map[string]interface{}, fs []T) ([]byte, error) {
+func NewFrameWithFields[T EncodableField](function uint8, params map[string]interface{}, fs []T) (*Frame, error) {
 	data, err := Encode(params, fs)
 	if err != nil {
 		return nil, err
 	}
-	f := Frame{Function: function}
+	f := &Frame{Function: function}
 	f.SetData(data)
-	return f.Bytes(), nil
+	return f, nil
 }
