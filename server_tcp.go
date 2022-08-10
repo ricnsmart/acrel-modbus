@@ -263,7 +263,7 @@ func (c *conn) serve() {
 func (c *conn) write(buf []byte) error {
 	_ = c.rwc.SetWriteDeadline(time.Now().Add(c.server.writeTimeout))
 
-	defer c.rwc.SetReadDeadline(time.Time{})
+	defer c.rwc.SetWriteDeadline(time.Time{})
 
 	if _, err := c.rwc.Write(buf); err != nil {
 		return err
