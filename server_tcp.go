@@ -199,6 +199,7 @@ type conn struct {
 }
 
 func (c *conn) serve() {
+	defer c.rwc.Close()
 
 	// upCh 设备上发的数据
 	upCh := make(chan []byte)
