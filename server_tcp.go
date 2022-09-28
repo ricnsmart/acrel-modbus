@@ -9,6 +9,11 @@ import (
 	"time"
 )
 
+const (
+	ERROR = iota + 1
+	DEBUG
+)
+
 // Handler 安科瑞设备上报数据处理器
 // addr 连接标识
 // data 上报数据
@@ -34,7 +39,7 @@ type Server struct {
 
 	onConnClose func(addr net.Addr)
 
-	debug bool
+	logLevel int
 }
 
 var DefaultReadTimeout = 60 * time.Second
@@ -69,8 +74,8 @@ func (s *Server) SetOnConnClose(f func(addr net.Addr)) {
 	s.onConnClose = f
 }
 
-func (s *Server) SetDebug(debug bool) {
-	s.debug = debug
+func (s *Server) SetDebug(logLevel int) {
+	s.logLevel = logLevel
 }
 
 func (s *Server) ListenAndServe() error {
@@ -227,14 +232,16 @@ func (c *conn) serve() {
 
 			l, err := c.rwc.Read(buf)
 			if err != nil {
-				log.Printf("ERROR %v\n", err)
+				if c.server.logLevel >= ERROR {
+					log.Printf("ERROR %v\n", err)
+				}
 				c.cancel()
 				return
 			}
 
 			buf = buf[:l]
 
-			if c.server.debug {
+			if c.server.logLevel == DEBUG {
 				log.Printf("DEBUG % x\n", buf)
 			}
 
@@ -278,7 +285,7 @@ func (c *conn) write(buf []byte) error {
 
 	defer c.rwc.SetWriteDeadline(time.Time{})
 
-	if c.server.debug {
+	if c.server.logLevel == DEBUG {
 		log.Printf("DEBUG % x\n", buf)
 	}
 
