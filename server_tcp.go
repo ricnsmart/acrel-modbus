@@ -227,6 +227,7 @@ func (c *conn) serve() {
 
 			l, err := c.rwc.Read(buf)
 			if err != nil {
+				log.Printf("ERROR %v\n", err)
 				c.cancel()
 				return
 			}
@@ -234,7 +235,7 @@ func (c *conn) serve() {
 			buf = buf[:l]
 
 			if c.server.debug {
-				log.Printf("% x\n", buf)
+				log.Printf("DEBUG % x\n", buf)
 			}
 
 			upCh <- buf
@@ -278,7 +279,7 @@ func (c *conn) write(buf []byte) error {
 	defer c.rwc.SetWriteDeadline(time.Time{})
 
 	if c.server.debug {
-		log.Printf("% x\n", buf)
+		log.Printf("DEBUG % x\n", buf)
 	}
 
 	if _, err := c.rwc.Write(buf); err != nil {
