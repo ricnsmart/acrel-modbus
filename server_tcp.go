@@ -74,7 +74,7 @@ func (s *Server) SetOnConnClose(f func(addr net.Addr)) {
 	s.onConnClose = f
 }
 
-func (s *Server) SetDebug(logLevel int) {
+func (s *Server) SetLogLevel(logLevel int) {
 	s.logLevel = logLevel
 }
 
