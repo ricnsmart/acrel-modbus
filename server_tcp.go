@@ -3,6 +3,7 @@ package acrel
 import (
 	"context"
 	"errors"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -32,6 +33,8 @@ type Server struct {
 	readSize int
 
 	onConnClose func(addr net.Addr)
+
+	debug bool
 }
 
 var DefaultReadTimeout = 60 * time.Second
@@ -64,6 +67,10 @@ func (s *Server) SetMaxReadSize(size int) {
 
 func (s *Server) SetOnConnClose(f func(addr net.Addr)) {
 	s.onConnClose = f
+}
+
+func (s *Server) SetDebug(debug bool) {
+	s.debug = debug
 }
 
 func (s *Server) ListenAndServe() error {
@@ -226,6 +233,10 @@ func (c *conn) serve() {
 
 			buf = buf[:l]
 
+			if c.server.debug {
+				log.Printf("% x\n", buf)
+			}
+
 			upCh <- buf
 			_ = c.rwc.SetReadDeadline(time.Time{})
 		}
@@ -265,6 +276,10 @@ func (c *conn) write(buf []byte) error {
 	_ = c.rwc.SetWriteDeadline(time.Now().Add(c.server.writeTimeout))
 
 	defer c.rwc.SetWriteDeadline(time.Time{})
+
+	if c.server.debug {
+		log.Printf("% x\n", buf)
+	}
 
 	if _, err := c.rwc.Write(buf); err != nil {
 		return err
