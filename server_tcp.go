@@ -42,9 +42,9 @@ type Server struct {
 	logLevel int
 }
 
-var DefaultReadTimeout = 60 * time.Second
+var DefaultReadTimeout = 120 * time.Second
 
-var DefaultWriteTimeout = 60 * time.Second
+var DefaultWriteTimeout = 120 * time.Second
 
 var DefaultMaxReadSize = 512
 
