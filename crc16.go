@@ -1,4 +1,4 @@
-package acrel
+package modbus
 
 import "sync"
 

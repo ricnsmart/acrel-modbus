@@ -1,297 +1,209 @@
-package acrel
+package modbus
 
 import (
 	"context"
-	"errors"
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
+type ErrorLevel uint8
+
 const (
-	ERROR = iota + 1
+	Silent ErrorLevel = iota
+	INFO
+	ERROR
 	DEBUG
 )
 
-// Handler 安科瑞设备上报数据处理器
-// addr 连接标识
-// data 上报数据
-// answer 用于应答设备主动上报，其中payload是应答设备的报文
-// response 用于收集设备响应server下发的命令，payload是来自设备的应答
-type Handler func(addr net.Addr, data []byte, answer func(payload []byte) error, response func(payload []byte))
+var DefaultReadDeadLine = 120 * time.Second
+
+var DefaultWriteDeadLine = 120 * time.Second
+
+var DefaultReadSize uint16 = 512
 
 type Server struct {
-	addr string
+	address       string
+	serve         func(conn *Conn)
+	readSize      uint16
+	readDeadLine  time.Duration
+	writeDeadLine time.Duration
 
-	handle Handler
+	logLevel ErrorLevel
 
-	readTimeout time.Duration
+	// 打印连接数量的时间间隔，默认5分钟
+	interval time.Duration
 
-	writeTimeout time.Duration
-
-	// 存储连接
-	// 用于主动关闭连接
-	connMap sync.Map
-
-	// 设备上报数据，server一次读取多少个字节
-	readSize int
-
-	onConnClose func(addr net.Addr)
-
-	logLevel int
+	// 连接总数
+	total int32
 }
 
-var DefaultReadTimeout = 120 * time.Second
-
-var DefaultWriteTimeout = 120 * time.Second
-
-var DefaultMaxReadSize = 512
-
-func NewServer(addr string, handle Handler) *Server {
+func NewServer(address string) *Server {
 	return &Server{
-		addr:         addr,
-		handle:       handle,
-		readTimeout:  DefaultReadTimeout,
-		writeTimeout: DefaultWriteTimeout,
-		readSize:     DefaultMaxReadSize,
+		address:       address,
+		readSize:      DefaultReadSize,
+		readDeadLine:  DefaultReadDeadLine,
+		writeDeadLine: DefaultWriteDeadLine,
+		logLevel:      ERROR,
+		interval:      5 * time.Minute,
+		total:         0,
 	}
 }
 
-func (s *Server) SetReadTimeout(t time.Duration) {
-	s.readTimeout = t
+func (s *Server) SetServe(serve func(conn *Conn)) {
+	s.serve = serve
 }
 
-func (s *Server) SetWriteTimeout(t time.Duration) {
-	s.writeTimeout = t
+func (s *Server) SetReadDeadline(readDeadLine time.Duration) {
+	s.readDeadLine = readDeadLine
 }
 
-func (s *Server) SetMaxReadSize(size int) {
+func (s *Server) SetWriteDeadline(writeDeadLine time.Duration) {
+	s.writeDeadLine = writeDeadLine
+}
+
+func (s *Server) SetMaxReadSize(size uint16) {
 	s.readSize = size
 }
 
-func (s *Server) SetOnConnClose(f func(addr net.Addr)) {
-	s.onConnClose = f
+func (s *Server) SetInterval(interval time.Duration) {
+	s.interval = interval
 }
 
-func (s *Server) SetLogLevel(logLevel int) {
+func (s *Server) SetLogLevel(logLevel ErrorLevel) {
 	s.logLevel = logLevel
 }
 
 func (s *Server) ListenAndServe() error {
-	ln, err := net.Listen("tcp", s.addr)
+	listener, err := net.Listen("tcp", s.address)
 	if err != nil {
 		return err
 	}
 
-	defer ln.Close()
+	defer listener.Close()
 
+	if s.logLevel >= INFO {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			ticker := time.NewTicker(s.interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					ticker.Stop()
+					ticker = time.NewTicker(s.interval)
+					log.Printf("INFO connections: %v\n", s.total)
+				}
+			}
+		}()
+	}
 	for {
-		rwc, err := ln.Accept()
+		rwc, err := listener.Accept()
 		if err != nil {
 			return err
 		}
 
-		go s.newConn(rwc).serve()
+		atomic.AddInt32(&s.total, 1)
+
+		go func() {
+			s.serve(&Conn{rwc: rwc, server: s})
+			atomic.AddInt32(&s.total, -1)
+		}()
 	}
 }
 
-func (s *Server) CloseConn(addr any) error {
-	v, ok := s.connMap.Load(addr)
-	if !ok {
-		return errors.New("connection not found")
-	}
-	return v.(*conn).rwc.Close()
-}
-
-func (s *Server) DownloadCommandToAll(ctx context.Context, cmd []byte, callback func(addr any, err error)) {
-
-	s.connMap.Range(func(key, value any) bool {
-		conn := value.(*conn)
-
-		conn.mu.Lock()
-		defer conn.mu.Unlock()
-
-		select {
-		case <-conn.ctx.Done():
-			callback(key, errors.New("connection closed"))
-			return false
-		case <-ctx.Done():
-			callback(key, errors.New("download closed"))
-			return false
-		case conn.downCh <- cmd:
-
-		}
-
-		select {
-		case <-conn.ctx.Done():
-			callback(key, errors.New("connection closed"))
-		case <-ctx.Done():
-			callback(key, errors.New("response timeout"))
-		case <-conn.respCh:
-
-		}
-		return false
-	})
-
-}
-
-func (s *Server) DownloadCommand(ctx context.Context, addr any, cmd []byte) ([]byte, error) {
-	c, ok := s.connMap.Load(addr)
-	if !ok {
-		return nil, errors.New("connection not found")
-	}
-
-	conn := c.(*conn)
-
-	conn.mu.Lock()
-	defer conn.mu.Unlock()
-
-	select {
-	case <-conn.ctx.Done():
-		return nil, errors.New("connection closed")
-	case <-ctx.Done():
-		return nil, errors.New("download timeout")
-	case conn.downCh <- cmd:
-
-	}
-
-	select {
-	case <-conn.ctx.Done():
-		return nil, errors.New("connection closed")
-	case <-ctx.Done():
-		return nil, errors.New("response timeout")
-	case resp := <-conn.respCh:
-		return resp, nil
-	}
-}
-
-func (s *Server) newConn(rwc net.Conn) *conn {
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	c := &conn{
-		server: s,
-		rwc:    rwc,
-		downCh: make(chan []byte),
-		respCh: make(chan []byte),
-		ctx:    ctx,
-		cancel: cancel,
-	}
-
-	s.connMap.Store(rwc.RemoteAddr(), c)
-
-	return c
-}
-
-type conn struct {
-	// server is the server on which the connection arrived.
-	// Immutable; never nil.
+type Conn struct {
+	rwc    net.Conn
 	server *Server
-
-	// rwc is the underlying network connection.
-	// This is never wrapped by other types and is the value given out
-	// to CloseNotifier callers. It is usually of type *net.TCPConn or
-	// *tls.conn.
-	rwc net.Conn
-
-	// downCh 用户向设备下发的数据
-	downCh chan []byte
-
-	// respCh 用于存放下发后设备的响应
-	respCh chan []byte
-
-	// 控制连接的关闭
-	ctx context.Context
-
-	cancel context.CancelFunc
-
-	// 控制写入频率
-	mu sync.Mutex
+	mu     sync.Mutex
 }
 
-func (c *conn) serve() {
-	defer c.rwc.Close()
+func (c *Conn) read() ([]byte, error) {
+	_ = c.rwc.SetReadDeadline(time.Now().Add(c.server.readDeadLine))
 
-	// upCh 设备上发的数据
-	upCh := make(chan []byte)
-	defer close(upCh)
+	defer c.rwc.SetReadDeadline(time.Time{})
 
-	// 设备离线
-	// 同时这也是判断设备是否在线的依据
-	defer func() {
-		c.server.onConnClose(c.rwc.RemoteAddr())
-		c.server.connMap.Delete(c.rwc)
-	}()
+	buf := make([]byte, c.server.readSize)
 
-	go func() {
-		for {
-			_ = c.rwc.SetReadDeadline(time.Now().Add(c.server.readTimeout))
-
-			buf := make([]byte, c.server.readSize)
-
-			l, err := c.rwc.Read(buf)
-			if err != nil {
-				if c.server.logLevel >= ERROR {
-					log.Printf("ERROR %v\n", err)
-				}
-				c.cancel()
-				return
-			}
-
-			buf = buf[:l]
-
-			if c.server.logLevel == DEBUG {
-				log.Printf("DEBUG % x\n", buf)
-			}
-
-			upCh <- buf
-			_ = c.rwc.SetReadDeadline(time.Time{})
-		}
-	}()
-
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		case packet := <-upCh:
-			go c.server.handle(c.rwc.RemoteAddr(), packet, func(payload []byte) error {
-				if err := c.write(payload); err != nil {
-					c.cancel()
-					return err
-				}
-				return nil
-			}, func(payload []byte) {
-				ticker := time.NewTicker(c.server.readTimeout)
-
-				select {
-				case <-ticker.C:
-				case c.respCh <- payload:
-
-				}
-				ticker.Stop()
-			})
-		case payload := <-c.downCh:
-			if err := c.write(payload); err != nil {
-				c.cancel()
-				return
-			}
-		}
+	l, err := c.rwc.Read(buf)
+	if err != nil {
+		return nil, err
 	}
+
+	if c.server.logLevel == DEBUG {
+		log.Printf("DEBUG %v read: % x\n", c.rwc.RemoteAddr(), buf[:l])
+	}
+
+	return buf[:l], nil
 }
 
-func (c *conn) write(buf []byte) error {
-	_ = c.rwc.SetWriteDeadline(time.Now().Add(c.server.writeTimeout))
+func (c *Conn) write(buf []byte) error {
+	_ = c.rwc.SetWriteDeadline(time.Now().Add(c.server.writeDeadLine))
 
 	defer c.rwc.SetWriteDeadline(time.Time{})
 
 	if c.server.logLevel == DEBUG {
-		log.Printf("DEBUG % x\n", buf)
+		log.Printf("DEBUG %v write: % x\n", c.rwc.RemoteAddr(), buf)
 	}
 
-	if _, err := c.rwc.Write(buf); err != nil {
-		return err
+	_, err := c.rwc.Write(buf)
+
+	return err
+}
+
+func (c *Conn) Close() error {
+	return c.rwc.Close()
+}
+
+func (c *Conn) Addr() net.Addr {
+	return c.rwc.RemoteAddr()
+}
+
+func (c *Conn) Lock() {
+	c.mu.Lock()
+}
+
+func (c *Conn) Unlock() {
+	c.mu.Unlock()
+}
+
+func (c *Conn) NewRequest(frame *Frame) (*Frame, error) {
+	c.mu.Lock()
+	defer func() {
+		// 控制请求频率，减少粘包
+		time.Sleep(100)
+		c.mu.Unlock()
+	}()
+
+	if err := c.write(frame.Bytes()); err != nil {
+		return nil, err
 	}
 
-	return nil
+	buf, err := c.read()
+	if err != nil {
+		return nil, err
+	}
+	return NewFrame(buf)
+}
+
+func (c *Conn) Ask() (*Frame, func(*Frame) error, error) {
+	c.mu.Lock()
+	data, err := c.read()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	frame, err := NewFrame(data)
+	return frame, func(f *Frame) error {
+		defer func() {
+			time.Sleep(100)
+			c.mu.Unlock()
+		}()
+		return c.write(f.Bytes())
+	}, err
 }

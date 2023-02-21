@@ -1,4 +1,4 @@
-package acrel
+package modbus
 
 import (
 	"encoding/binary"
@@ -56,6 +56,7 @@ func NewFrame(packet []byte) (*Frame, error) {
 
 func (frame *Frame) Copy() *Frame {
 	f := *frame
+	f.SetData(nil)
 	return &f
 }
 

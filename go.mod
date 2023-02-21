@@ -1,3 +1,3 @@
 module github.com/ricnsmart/acrel-modbus
 
-go 1.19
+go 1.20
