@@ -2,6 +2,7 @@ package modbus
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net"
 	"sync"
@@ -17,18 +18,9 @@ const (
 	DEBUG
 )
 
-var DefaultReadDeadLine = 120 * time.Second
-
-var DefaultWriteDeadLine = 120 * time.Second
-
-var DefaultReadSize uint16 = 512
-
 type Server struct {
-	address       string
-	serve         func(conn *Conn)
-	readSize      uint16
-	readDeadLine  time.Duration
-	writeDeadLine time.Duration
+	address string
+	serve   func(conn *Conn)
 
 	logLevel ErrorLevel
 
@@ -38,29 +30,14 @@ type Server struct {
 
 func NewServer(address string) *Server {
 	return &Server{
-		address:       address,
-		readSize:      DefaultReadSize,
-		readDeadLine:  DefaultReadDeadLine,
-		writeDeadLine: DefaultWriteDeadLine,
-		logLevel:      ERROR,
-		interval:      5 * time.Minute,
+		address:  address,
+		logLevel: ERROR,
+		interval: 5 * time.Minute,
 	}
 }
 
 func (s *Server) SetServe(serve func(conn *Conn)) {
 	s.serve = serve
-}
-
-func (s *Server) SetReadDeadline(readDeadLine time.Duration) {
-	s.readDeadLine = readDeadLine
-}
-
-func (s *Server) SetWriteDeadline(writeDeadLine time.Duration) {
-	s.writeDeadLine = writeDeadLine
-}
-
-func (s *Server) SetMaxReadSize(size uint16) {
-	s.readSize = size
 }
 
 func (s *Server) SetInterval(interval time.Duration) {
@@ -108,7 +85,7 @@ func (s *Server) ListenAndServe() error {
 		counter.Add(1)
 
 		go func() {
-			s.serve(&Conn{rwc: rwc, server: s})
+			s.serve(&Conn{rwc: rwc, server: s, ch: make(chan *Frame)})
 			_ = rwc.Close()
 			counter.Add(-1)
 		}()
@@ -119,14 +96,15 @@ type Conn struct {
 	rwc    net.Conn
 	server *Server
 	mu     sync.Mutex
+	ch     chan *Frame
 }
 
-func (c *Conn) read() ([]byte, error) {
-	_ = c.rwc.SetReadDeadline(time.Now().Add(c.server.readDeadLine))
+func (c *Conn) Read(timeout time.Duration, size int) ([]byte, error) {
+	_ = c.rwc.SetDeadline(time.Now().Add(timeout))
 
-	defer c.rwc.SetReadDeadline(time.Time{})
+	defer c.rwc.SetDeadline(time.Time{})
 
-	buf := make([]byte, c.server.readSize)
+	buf := make([]byte, size)
 
 	l, err := c.rwc.Read(buf)
 	if err != nil {
@@ -140,10 +118,56 @@ func (c *Conn) read() ([]byte, error) {
 	return buf[:l], nil
 }
 
-func (c *Conn) write(buf []byte) error {
-	_ = c.rwc.SetWriteDeadline(time.Now().Add(c.server.writeDeadLine))
+func (c *Conn) ReadFrame(timeout time.Duration, size int) (*Frame, error) {
+	_ = c.rwc.SetDeadline(time.Now().Add(timeout))
 
-	defer c.rwc.SetWriteDeadline(time.Time{})
+	defer c.rwc.SetDeadline(time.Time{})
+
+	buf := make([]byte, size)
+
+	l, err := c.rwc.Read(buf)
+	if err != nil {
+		return nil, err
+	}
+
+	if c.server.logLevel == DEBUG {
+		log.Printf("DEBUG %v read: % x\n", c.rwc.RemoteAddr(), buf[:l])
+	}
+
+	return NewFrame(buf[:l])
+}
+
+func (c *Conn) Write(timeout time.Duration, buf []byte) error {
+	c.mu.Lock()
+	defer func() {
+		// 控制请求频率，减少粘包
+		time.Sleep(100)
+		c.mu.Unlock()
+	}()
+	_ = c.rwc.SetDeadline(time.Now().Add(timeout))
+
+	defer c.rwc.SetDeadline(time.Time{})
+
+	if c.server.logLevel == DEBUG {
+		log.Printf("DEBUG %v write: % x\n", c.rwc.RemoteAddr(), buf)
+	}
+
+	_, err := c.rwc.Write(buf)
+
+	return err
+}
+
+func (c *Conn) WriteFrame(timeout time.Duration, frame *Frame) error {
+	c.mu.Lock()
+	defer func() {
+		// 控制请求频率，减少粘包
+		time.Sleep(100)
+		c.mu.Unlock()
+	}()
+	buf := frame.Bytes()
+	_ = c.rwc.SetDeadline(time.Now().Add(timeout))
+
+	defer c.rwc.SetDeadline(time.Time{})
 
 	if c.server.logLevel == DEBUG {
 		log.Printf("DEBUG %v write: % x\n", c.rwc.RemoteAddr(), buf)
@@ -162,59 +186,21 @@ func (c *Conn) Addr() net.Addr {
 	return c.rwc.RemoteAddr()
 }
 
-func (c *Conn) Lock() {
-	c.mu.Lock()
-}
+func (c *Conn) Store(ctx context.Context, frame *Frame) error {
+	select {
+	case <-ctx.Done():
+		return errors.New("写入超时")
+	case c.ch <- frame:
 
-func (c *Conn) Unlock() {
-	c.mu.Unlock()
-}
-
-func (c *Conn) NewRequest(frame *Frame) (*Frame, error) {
-	c.mu.Lock()
-	defer func() {
-		// 控制请求频率，减少粘包
-		time.Sleep(100)
-		c.mu.Unlock()
-	}()
-
-	if err := c.write(frame.Bytes()); err != nil {
-		return nil, err
 	}
-
-	buf, err := c.read()
-	if err != nil {
-		return nil, err
-	}
-	return NewFrame(buf)
+	return nil
 }
 
-func (c *Conn) Ask() (*Frame, func(*Frame) error, error) {
-	c.mu.Lock()
-	data, err := c.read()
-	if err != nil {
-		return nil, nil, err
+func (c *Conn) Load(ctx context.Context) (*Frame, error) {
+	select {
+	case <-ctx.Done():
+		return nil, errors.New("写入超时")
+	case frame := <-c.ch:
+		return frame, nil
 	}
-
-	frame, err := NewFrame(data)
-	return frame, func(f *Frame) error {
-		defer func() {
-			time.Sleep(100)
-			c.mu.Unlock()
-		}()
-		return c.write(f.Bytes())
-	}, err
-}
-
-// Download 只下发命令，不等待设备响应
-// 比如修改设备指向，设备将不会回应，如果等待，需要等待到连接超时
-func (c *Conn) Download(frame *Frame) error {
-	c.mu.Lock()
-	defer func() {
-		// 控制请求频率，减少粘包
-		time.Sleep(100)
-		c.mu.Unlock()
-	}()
-
-	return c.write(frame.Bytes())
 }
