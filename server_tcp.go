@@ -85,7 +85,7 @@ func (s *Server) ListenAndServe() error {
 		counter.Add(1)
 
 		go func() {
-			s.serve(&Conn{rwc: rwc, server: s, ch: make(chan *Frame)})
+			s.serve(&Conn{rwc: rwc, server: s})
 			_ = rwc.Close()
 			counter.Add(-1)
 		}()
@@ -138,12 +138,8 @@ func (c *Conn) ReadFrame(timeout time.Duration, size int) (*Frame, error) {
 }
 
 func (c *Conn) Write(timeout time.Duration, buf []byte) error {
-	c.mu.Lock()
-	defer func() {
-		// 控制请求频率，减少粘包
-		time.Sleep(100)
-		c.mu.Unlock()
-	}()
+	// 控制写入频率，减少粘包
+	defer time.Sleep(100)
 	_ = c.rwc.SetDeadline(time.Now().Add(timeout))
 
 	defer c.rwc.SetDeadline(time.Time{})
@@ -158,12 +154,8 @@ func (c *Conn) Write(timeout time.Duration, buf []byte) error {
 }
 
 func (c *Conn) WriteFrame(timeout time.Duration, frame *Frame) error {
-	c.mu.Lock()
-	defer func() {
-		// 控制请求频率，减少粘包
-		time.Sleep(100)
-		c.mu.Unlock()
-	}()
+	// 控制写入频率，减少粘包
+	defer time.Sleep(100)
 	buf := frame.Bytes()
 	_ = c.rwc.SetDeadline(time.Now().Add(timeout))
 
@@ -186,10 +178,21 @@ func (c *Conn) Addr() net.Addr {
 	return c.rwc.RemoteAddr()
 }
 
+func (c *Conn) NewChan() {
+	c.ch = make(chan *Frame)
+}
+func (c *Conn) CloseChan() {
+	close(c.ch)
+	c.ch = nil
+}
+
 func (c *Conn) Store(ctx context.Context, frame *Frame) error {
+	if c.ch == nil {
+		return nil
+	}
 	select {
 	case <-ctx.Done():
-		return errors.New("写入超时")
+		return errors.New("timeout")
 	case c.ch <- frame:
 
 	}
@@ -197,10 +200,24 @@ func (c *Conn) Store(ctx context.Context, frame *Frame) error {
 }
 
 func (c *Conn) Load(ctx context.Context) (*Frame, error) {
+	if c.ch == nil {
+		return nil, errors.New("nil chan")
+	}
 	select {
 	case <-ctx.Done():
-		return nil, errors.New("写入超时")
-	case frame := <-c.ch:
-		return frame, nil
+		return nil, errors.New("timeout")
+	case frame, ok := <-c.ch:
+		if ok {
+			return frame, nil
+		}
+		return nil, errors.New("channel closed")
 	}
+}
+
+func (c *Conn) Lock() {
+	c.mu.Lock()
+}
+
+func (c *Conn) Unlock() {
+	c.mu.Unlock()
 }
